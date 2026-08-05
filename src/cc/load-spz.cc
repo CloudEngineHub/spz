@@ -1348,71 +1348,17 @@ GaussianCloud loadSplatFromPly(const std::string &filename, const UnpackOptions 
 }
 
 bool saveSplatToPly(const GaussianCloud &data, const PackOptions &o, const std::string &filename) {
-  const int32_t N = data.numPoints;
+  // Use int64_t for N so that N*D never overflows int32_t for clouds with >35M gaussians.
+  const int64_t N = data.numPoints;
   CHECK_EQ(data.positions.size(), N * 3);
   CHECK_EQ(data.scales.size(), N * 3);
   CHECK_EQ(data.rotations.size(), N * 4);
   CHECK_EQ(data.alphas.size(), N);
   CHECK_EQ(data.colors.size(), N * 3);
-  const int32_t shDim = static_cast<int>(data.sh.size() / N / 3);
-  const int32_t D = 17 + shDim * 3;
+  const int64_t shDim = (N > 0) ? static_cast<int64_t>(data.sh.size() / N / 3) : 0;
+  const int64_t D = 17 + shDim * 3;
 
   CoordinateConverter c = coordinateConverter(o.from, CoordinateSystem::RDF, data.shDegree);
-
-  std::vector<float> values(N * D, 0.0f);
-  std::array<float, 4> bufQuat = {};
-  int32_t outIdx = 0, i3 = 0, i4 = 0;
-  for (int32_t i = 0; i < N; i++) {
-    // Position (x, y, z)
-    for (size_t j = 0; j < 3; j++) { values[outIdx + j] = data.positions[i3 + j]; }
-    if (c.rotFlipPFunc) {
-      c.rotFlipPFunc(values.data() + outIdx);
-    } else {
-      for (size_t j = 0; j < 3; j++) { values[outIdx + j] *= c.flipP[j]; }
-    }
-    outIdx += 3;
-    // Normals (nx, ny, nz): these are always zero, but some viewers expect them to be present
-    outIdx += 3;
-    // Color (r, g, b): DC component for spherical harmonics
-    values[outIdx++] = data.colors[i3 + 0];
-    values[outIdx++] = data.colors[i3 + 1];
-    values[outIdx++] = data.colors[i3 + 2];
-    // Spherical harmonics: Interleave so the coefficients are the fastest-changing axis and
-    // the channel (r, g, b) is slower-changing axis.
-    for (int32_t k = 0; k < 3; k++) {
-      for (int32_t j = 0; j < shDim; j++) {
-        values[outIdx + j] = data.sh[(i * shDim + j) * 3 + k];
-      }
-      for (int32_t band = 0; band < data.shDegree && band < SH_MAX_DEGREE; ++band) {
-        if (c.rotFlipShFuncs[static_cast<size_t>(band)]) {
-          c.rotFlipShFuncs[static_cast<size_t>(band)](values.data() + outIdx + static_cast<size_t>(band * (band + 2)));
-        }
-      }
-      for (int32_t j = 0; j < shDim; j++) { values[outIdx + j] *= c.flipSh[j]; }
-      outIdx += shDim;
-    }
-    // Alpha
-    values[outIdx++] = data.alphas[i];
-    // Scale (sx, sy, sz)
-    values[outIdx++] = data.scales[i3 + 0];
-    values[outIdx++] = data.scales[i3 + 1];
-    values[outIdx++] = data.scales[i3 + 2];
-    // Rotation (qw, qx, qy, qz)
-    for (int32_t j = 0; j < 4; j++) { bufQuat[j] = data.rotations[i4 + j]; }
-    if (c.rotFlipQFunc) {
-      c.rotFlipQFunc(bufQuat.data());
-    } else {
-      for (int32_t j = 0; j < 3; j++) { bufQuat[j] *= c.flipQ[j]; }
-    }
-    // data.rotations are x,y,z,w per point; PLY expects w then x,y,z (see property order below).
-    values[outIdx++] = bufQuat[3];
-    values[outIdx++] = bufQuat[0];
-    values[outIdx++] = bufQuat[1];
-    values[outIdx++] = bufQuat[2];
-    i3 += 3;
-    i4 += 4;
-  }
-  CHECK_EQ(outIdx, values.size());
 
   std::ofstream out(filename, std::ios::binary);
   if (!out.good()) {
@@ -1431,7 +1377,7 @@ bool saveSplatToPly(const GaussianCloud &data, const PackOptions &o, const std::
   out << "property float f_dc_0\n";
   out << "property float f_dc_1\n";
   out << "property float f_dc_2\n";
-  for (int32_t i = 0; i < shDim * 3; i++) {
+  for (int64_t i = 0; i < shDim * 3; i++) {
     out << "property float f_rest_" << i << "\n";
   }
   out << "property float opacity\n";
@@ -1448,7 +1394,72 @@ bool saveSplatToPly(const GaussianCloud &data, const PackOptions &o, const std::
 #endif
 
   out << "end_header\n";
-  out.write(reinterpret_cast<char *>(values.data()), values.size() * sizeof(float));
+
+  // Write in chunks of 1M points to bound peak memory regardless of cloud size.
+  const int64_t kChunkSize = 1'000'000;
+  std::vector<float> values(std::min(kChunkSize, N) * D);
+  std::array<float, 4> bufQuat = {};
+  for (int64_t start = 0; start < N; start += kChunkSize) {
+    const int64_t end = std::min(start + kChunkSize, N);
+    const int64_t rowCount = end - start;
+    if (rowCount * D != static_cast<int64_t>(values.size())) {
+      values.resize(rowCount * D);
+    }
+    int64_t outIdx = 0;
+    for (int64_t i = start; i < end; i++) {
+      const int64_t i3 = i * 3;
+      const int64_t i4 = i * 4;
+      // Position (x, y, z)
+      for (size_t j = 0; j < 3; j++) { values[outIdx + j] = data.positions[i3 + j]; }
+      if (c.rotFlipPFunc) {
+        c.rotFlipPFunc(values.data() + outIdx);
+      } else {
+        for (size_t j = 0; j < 3; j++) { values[outIdx + j] *= c.flipP[j]; }
+      }
+      outIdx += 3;
+      // Normals (nx, ny, nz): always zero, but some viewers expect them present
+      values[outIdx] = 0.0f; values[outIdx + 1] = 0.0f; values[outIdx + 2] = 0.0f;
+      outIdx += 3;
+      // Color (r, g, b): DC component for spherical harmonics
+      values[outIdx++] = data.colors[i3 + 0];
+      values[outIdx++] = data.colors[i3 + 1];
+      values[outIdx++] = data.colors[i3 + 2];
+      // Spherical harmonics: Interleave so the coefficients are the fastest-changing axis and
+      // the channel (r, g, b) is slower-changing axis.
+      for (int64_t k = 0; k < 3; k++) {
+        for (int64_t j = 0; j < shDim; j++) {
+          values[outIdx + j] = data.sh[(i * shDim + j) * 3 + k];
+        }
+        for (int32_t band = 0; band < data.shDegree && band < SH_MAX_DEGREE; ++band) {
+          if (c.rotFlipShFuncs[static_cast<size_t>(band)]) {
+            c.rotFlipShFuncs[static_cast<size_t>(band)](values.data() + outIdx + static_cast<size_t>(band * (band + 2)));
+          }
+        }
+        for (int64_t j = 0; j < shDim; j++) { values[outIdx + j] *= c.flipSh[j]; }
+        outIdx += shDim;
+      }
+      // Alpha
+      values[outIdx++] = data.alphas[i];
+      // Scale (sx, sy, sz)
+      values[outIdx++] = data.scales[i3 + 0];
+      values[outIdx++] = data.scales[i3 + 1];
+      values[outIdx++] = data.scales[i3 + 2];
+      // Rotation (qw, qx, qy, qz)
+      for (int32_t j = 0; j < 4; j++) { bufQuat[j] = data.rotations[i4 + j]; }
+      if (c.rotFlipQFunc) {
+        c.rotFlipQFunc(bufQuat.data());
+      } else {
+        for (int32_t j = 0; j < 3; j++) { bufQuat[j] *= c.flipQ[j]; }
+      }
+      // data.rotations are x,y,z,w per point; PLY expects w then x,y,z (see property order below).
+      values[outIdx++] = bufQuat[3];
+      values[outIdx++] = bufQuat[0];
+      values[outIdx++] = bufQuat[1];
+      values[outIdx++] = bufQuat[2];
+    }
+    CHECK_EQ(outIdx, rowCount * D);
+    out.write(reinterpret_cast<char *>(values.data()), rowCount * D * sizeof(float));
+  }
 
 #ifdef SPZ_BUILD_EXTENSIONS
   writeExtensionsToPlyData(data.extensions, out);
